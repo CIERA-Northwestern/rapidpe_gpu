@@ -196,7 +196,7 @@ __global__ void nv_reduc(cuDoubleComplex *result, cuDoubleComplex *indat) {
 
 
 }
-__global__ void spread_rhoTS(int *ncols, int *nmodes, int *ntimes, cuDoubleComplex *rhots, cuDoubleComplex *rhots_all) {
+__global__ void expand_rhoTS(int *ncols, int *nmodes, int *ntimes, cuDoubleComplex *rhots, cuDoubleComplex *rhots_all) {
 	
 	int gid = get_global_idx_2d_1d();
 	int linidx = get_xidx_within_row();
@@ -282,7 +282,8 @@ print(spharms_l_eq_2[0:9])
 # nsamps * ncols. Must be careful 
 # to arrange correct axis as ncols
 
-pre_likelihood = np.zeros((nsamps*nmodes, ncols)).astype(np.complex128)
+pre_likelihood     = np.zeros((nsamps*nmodes, ncols)).astype(np.complex128)
+pre_likelihood_gpu = gpuarray.to_gpu(pre_likelihood)
 
 '''
  ***---------------***
@@ -308,10 +309,10 @@ pre_likelihood = np.zeros((nsamps*nmodes, ncols)).astype(np.complex128)
  -we can play with this
 '''	
 
-pre_likelihood_gpu = cuda.mem_alloc(pre_likelihood.nbytes)
+#pre_likelihood_gpu = cuda.mem_alloc(pre_likelihood.nbytes)
 #cuda.memcpy_htod(pre_likelihood_gpu, pre_likelihood)
 
-pre_likelihood_gpu = gpuarray.to_gpu(pre_likelihood) 
+#pre_likelihood_gpu = gpuarray.to_gpu(pre_likelihood) 
 
 #_____________________
 # build rhoTS 
@@ -330,27 +331,37 @@ print(rhoTS[:, 0:10])
 rhoTS_gpu = cuda.mem_alloc(rhoTS.nbytes)
 cuda.memcpy_htod(rhoTS_gpu, rhoTS)
 
-_get_spread_rhoTS   = mod.get_function("spread_rhoTS")
+_get_rhoTS_expander   = mod.get_function("expand_rhoTS")
+
+
+# We might not need this thanks to GPUarrays
 _get_pad_with_zeros = mod.get_function("pad_with_zeros")
 
 
 # Above two functions naturally group together
 # FIXME - should probably be combined into one
-def prep_rhots(rhoTS_spreader, zero_padder, ncols_gpu, nmodes_gpu, ntimes_gpu, rhoTS_gpu, pre_likelihood_gpu):
+def expand_rhoTS(rhoTS_expander, zero_padder, ncols_gpu, nmodes_gpu, ntimes_gpu, rhoTS_gpu, expansion_arr):
 	griddimx  = int(ncols[0] / max_tpb)	
 	griddimy  = int(nsamps[0]*nmodes[0])
 
 	grd = (griddimx, griddimy, 1) 
 	blk = (max_tpb,  1,        1) 
 
-	rhoTS_spreader(ncols_gpu, nmodes_gpu, ntimes_gpu, rhoTS_gpu, pre_likelihood_gpu, grid=grd, block=blk)
-#	zero_padder(pre_likelihood_gpu, ntimes_gpu, nsamps_gpu, ncols_gpu, padwidth_gpu, grid=(1, griddimy, 1), block=blk)
+	rhoTS_expander(ncols_gpu, nmodes_gpu, ntimes_gpu, rhoTS_gpu, expansion_arr, grid=grd, block=blk)
 
-	return pre_likelihood_gpu
+	# I don't think this is needed anymore
+	#zero_padder(pre_likelihood_gpu, ntimes_gpu, nsamps_gpu, ncols_gpu, padwidth_gpu, grid=(1, griddimy, 1), block=blk)
 
-pre_likelihood_gpu = prep_rhots(_get_spread_rhoTS, _get_pad_with_zeros, ncols_gpu, nmodes_gpu, ntimes_gpu, rhoTS_gpu, pre_likelihood_gpu) 
+	return expansion_arr
 
-cuda.memcpy_dtoh(pre_likelihood, pre_likelihood_gpu)
+rhoTS_expansion = expand_rhoTS(_get_rhoTS_expander, _get_pad_with_zeros, ncols_gpu, nmodes_gpu, ntimes_gpu, rhoTS_gpu, pre_likelihood_gpu) 
+
+
+#_____________________
+# Multiply in Ylms 
+#_____________________
+
+# The rhoTS_expansion
 
 
 
