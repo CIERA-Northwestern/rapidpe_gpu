@@ -20,7 +20,7 @@ device = cuda.Device(0)
 
 max_tpb = 512
 
-nsamps = np.array(1024, ndmin=1).astype(np.int32)
+nsamps = np.array(10240, ndmin=1).astype(np.int32)
 theta  = np.linspace(0, 2*math.pi, nsamps)
 phi    = np.linspace(0, 2*math.pi, nsamps)
 
@@ -161,15 +161,20 @@ __global__ void pad_with_zeros(cuDoubleComplex *arr_to_pad, int *ntimes, int *ns
         arr_to_pad[gid] = make_cuDoubleComplex(0.0, 0.0);       
 }
 
-__global__ void insert_ylms(cuDoubleComplex *padded_ts_all, cuDoubleComplex *ylms_all, int *nmodes, int *ncols) {
+__global__ void insert_ylms(cuDoubleComplex *padded_ts_all, cuDoubleComplex *ylms_all, int *nmodes, int *ncols, int *nsamps) {
         extern __shared__ cuDoubleComplex shr[]; // My Ylms will reside here     
         if (threadIdx.x < *nmodes) {
-        	cuDoubleComplex *my_mode_addr = &ylms_all[*nmodes * blockIdx.y];
-	      	shr[threadIdx.x] = my_mode_addr[threadIdx.x];   
+		int offset = (blockIdx.y - (blockIdx.y % *nmodes)) / *nmodes;
+		shr[threadIdx.x] = ylms_all[*nsamps*threadIdx.x + offset];
         }
-        
-          int gid = get_padded_idx_2d_1d(0, *ncols);      
-          padded_ts_all[gid] = cuCmul(padded_ts_all[gid], shr[blockIdx.y % *nmodes]); 
+       
+	__syncthreads();
+ 
+        int gid = get_global_idx_2d_1d() ;      
+	
+	cuDoubleComplex myins_val = cuCmul(padded_ts_all[gid], shr[blockIdx.y % *nmodes]); 
+
+        padded_ts_all[gid] = myins_val; 
 
 } 
 
@@ -203,17 +208,23 @@ __global__ void expand_rhoTS(int *ncols, int *nmodes, int *ntimes, cuDoubleCompl
 	int which_mode = blockIdx.y % *nmodes;
 
 	if (linidx < *ntimes) {
-//		cuDoubleComplex wut = make_cuDoubleComplex(0.0, 0.0);
-//		rhots_all[gid] = wut;   	
-
-//		cuDoubleComplex wut = rhots[*ntimes*which_mode + linidx];
 		rhots_all[gid] = rhots[*ntimes*which_mode + linidx];
 	}	
 	
 }
 
-__global__ void empty() {
-}
+__global__ void accordion(cuDoubleComplex *contr_arr, int *nmodes, int *ntimes, int *ncols) {
+	int linidx = get_xidx_within_row();	
+	int gid = get_global_idx_2d_1d();
+	
+	for (int mode = 0; mode < *nmodes - 1; mode++) {
+		cuDoubleComplex *myrow = &contr_arr[*ncols*(*nmodes * blockIdx.y + mode)];		
+		cuDoubleComplex *nxrow = &contr_arr[*ncols*(*nmodes * blockIdx.y + mode + 1)];
+		nxrow[linidx] = cuCadd(myrow[linidx], nxrow[linidx]);
+	}			
+} 
+
+
 ''')
 
 
@@ -241,14 +252,14 @@ def compute_spharms_l_eq_2(spharm_getter, th_gpu, ph_gpu, selected_modes_gpu, nm
 	return rslt_gpu 
 
 
-spharms_l_eq_2_gpu = compute_spharms_l_eq_2(_get_spharms_l_eq_2, theta_gpu, phi_gpu, mlist_gpu, nmodes_gpu, nsamps_gpu, spharms_l_eq_2_gpu)
+#spharms_l_eq_2_gpu = compute_spharms_l_eq_2(_get_spharms_l_eq_2, theta_gpu, phi_gpu, mlist_gpu, nmodes_gpu, nsamps_gpu, spharms_l_eq_2_gpu)
 
 #_____________________
 # FIXME -For Debugging 
 #_____________________
 
 
-cuda.memcpy_dtoh(spharms_l_eq_2, spharms_l_eq_2_gpu)
+#cuda.memcpy_dtoh(spharms_l_eq_2, spharms_l_eq_2_gpu)
 print(spharms_l_eq_2[0:9])
 
 '''
@@ -321,9 +332,9 @@ pre_likelihood_gpu = gpuarray.to_gpu(pre_likelihood)
 
 # This is honestly a negligable amount of total memory
 rhoTS = np.zeros((nmodes, ntimes)).astype(np.complex128)
-rhoTS[0,:] += np.arange(ntimes)*1.0j 
-rhoTS[1,:] += np.ones(ntimes)+(np.arange(ntimes)*1.0j) 
-rhoTS[2,:] += 2*np.ones(ntimes)+(np.arange(ntimes)*1.0j) 
+rhoTS[0,:] += np.ones(ntimes) 
+rhoTS[1,:] += np.ones(ntimes) 
+rhoTS[2,:] += np.ones(ntimes) 
 
 
 print(rhoTS[:, 0:10])
@@ -354,14 +365,105 @@ def expand_rhoTS(rhoTS_expander, zero_padder, ncols_gpu, nmodes_gpu, ntimes_gpu,
 
 	return expansion_arr
 
-rhoTS_expansion = expand_rhoTS(_get_rhoTS_expander, _get_pad_with_zeros, ncols_gpu, nmodes_gpu, ntimes_gpu, rhoTS_gpu, pre_likelihood_gpu) 
 
+rhoTS_expansion_gpu = expand_rhoTS(_get_rhoTS_expander, _get_pad_with_zeros, ncols_gpu, nmodes_gpu, ntimes_gpu, rhoTS_gpu, pre_likelihood_gpu) 
 
 #_____________________
 # Multiply in Ylms 
 #_____________________
 
-# The rhoTS_expansion
+'''
+ The rows in the expanded rhoTS are harmonic-mode time series 
+ from minimum m value to maximum
+
+         <- times ->
+         ___________>    _
+(2,-2)  |...........      |
+(2, 0)  |...........      |- sample 0
+(2, 2)  |...........     _|
+(2,-2)  |...........      |
+(2, 0)  |...........      |- sample 1
+(2, 2)  |...........     _|
+   .    v	          v	
+   .
+   .
+
+
+ However the Ylms array has one row per mode and one column 
+ for each sample. The sample-mode Ylms need to be multiplied in
+ to the sample-mode-timeseries before we contract th rhoTS to
+ create the set of "Term 1's" for the whole sample set
+'''
+
+_multiply_in_ylms = mod.get_function("insert_ylms") 
+
+def ylms_into_rhoTS(ylm_multiplier, expanded_rhoTS, all_ylms, nmodes_gpu, ncols_gpu, nsamps_gpu):
+	griddimx = int(ncols[0] / max_tpb)
+	griddimy = int(nsamps[0]*nmodes[0])
+
+	# We want to cover the whole expanded rhoTS in threads again	
+	grd = (griddimx, griddimy, 1)
+	blk = (max_tpb,  1,        1)	
+	ylm_multiplier(expanded_rhoTS, all_ylms, nmodes_gpu, ncols_gpu, nsamps_gpu, grid=grd, block=blk, shared=(int(nmodes[0] *16)))
+
+	return expanded_rhoTS
+
+#_____________________
+# Expanded Ylm Test 
+#_____________________
+
+spharms_l_eq_2 = np.zeros((nmodes, nsamps)).astype(np.complex128)
+for i in range(nmodes):
+	spharms_l_eq_2[i,:] = np.arange(nsamps)
+
+
+spharms_l_eq_2_gpu = gpuarray.to_gpu(spharms_l_eq_2)
+
+all_rhots_ylm = ylms_into_rhoTS(_multiply_in_ylms, rhoTS_expansion_gpu, spharms_l_eq_2_gpu, nmodes_gpu, ncols_gpu, nsamps_gpu)
+
+
+'''
+ The rhoTS have been multiplied by their corresponding Ylms
+ Now we need summing over the timeseries-ylms and producing
+ the large (first likelihood term). It needs to be folded 
+ up as follows:
+
+         <- times ->
+         ___________>   
+(2,-2)  |........... 
+          | | | | |  \     
+          v v v v v   |
+(2, 0)  |...........   -   SAMPLE 1
+          | | | | |   |    
+          v v v v v  /  
+(2, 2)  |...........    
+
+
+(2,-2)  |........... 
+          | | | | |  \     
+          v v v v v   |
+(2, 0)  |...........   -   SAMPLE 2
+          | | | | |   |  
+          v v v v v  /
+(2, 2)  |...........    
+   .         .	          .	
+   .         .            .
+    
+
+ We launch a row of blocks for every sample that is long 
+ enough to assign a thread on each element of the matrix
+ the threads then sum downwards into the row below a total
+ of nmodes times per thread
+
+ This ensures that there are no memory conflics or race conditions
+ each thread only ever reads or writes to memory locations 
+ that are completely unique to that thread.
+
+'''
+
+accordion = mod.get_function("accordion")
+accordion(all_rhots_ylm, nmodes_gpu, ntimes_gpu, ncols_gpu, grid=((int(ncols[0] / max_tpb)), int(nsamps[0]), 1), block=(max_tpb, 1, 1))
+
 
 
 
