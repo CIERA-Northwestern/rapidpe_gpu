@@ -65,7 +65,7 @@ spharms_l_eq_2_gpu = cuda.mem_alloc(theta.nbytes*len(mlist_sort) * 2)
 
 # Length of the time series
 
-ntimes = np.array(500, ndmin=1).astype(np.int32) 
+ntimes = np.array(600, ndmin=1).astype(np.int32) 
 ntimes_gpu = cuda.mem_alloc(ntimes.nbytes)
 cuda.memcpy_htod(ntimes_gpu, ntimes)
 
@@ -147,7 +147,7 @@ __device__ int get_padded_idx_2d_1d(int ntimes, int ncols) {
 
 // ROW MAJOR FORM
 __device__ int get_global_idx_2d_1d() {
-	return threadIdx.x + gridDim.x*blockDim.x*blockIdx.y;
+	return threadIdx.x + gridDim.x*blockDim.x*blockIdx.y + blockIdx.x*blockDim.x;
 }
 
 __device__ int get_xidx_within_row() {
@@ -178,25 +178,25 @@ __global__ void insert_ylms(cuDoubleComplex *padded_ts_all, cuDoubleComplex *ylm
 
 } 
 
-__global__ void nv_reduc(cuDoubleComplex *result, cuDoubleComplex *indat) {
+__global__ void nv_reduc(cuDoubleComplex *indat, int *ncols, int *nmodes) {
         extern __shared__ cuDoubleComplex shr[]; 
 
         // local and lobal thread ID
-        unsigned int lid = threadIdx.x; 
-        unsigned int gid = blockIdx.x*blockDim.x + threadIdx.x; 
+        unsigned int linidx = get_xidx_within_row();
 
-        shr[lid] = indat[gid];
+	cuDoubleComplex *myrow = &indat[*ncols*(*nmodes*blockIdx.y + *nmodes - 1) ];  	
+
+        shr[threadIdx.x] = myrow[linidx];
         __syncthreads();
 
         for (unsigned int s=blockDim.x/2; s>0; s /= 2) {
-                if (lid < s) {
-                        //shr[lid] += shr[lid + s]; 
-                        shr[lid] = make_cuDoubleComplex(cuCreal(shr[lid]) + cuCreal(shr[lid+s]), cuCimag(shr[lid]) + cuCimag(shr[lid+s]));
+                if (threadIdx.x < s) {
+			shr[threadIdx.x] = cuCadd(shr[threadIdx.x], shr[threadIdx.x+s]);
                 }
                 __syncthreads();
         }       
-        if (lid == 0) {
-                *result = shr[0];
+        if (threadIdx.x == 0) {
+                myrow[blockIdx.x] = shr[0];
         }
 
 
@@ -460,10 +460,37 @@ all_rhots_ylm = ylms_into_rhoTS(_multiply_in_ylms, rhoTS_expansion_gpu, spharms_
  that are completely unique to that thread.
 
 '''
-
 accordion = mod.get_function("accordion")
 accordion(all_rhots_ylm, nmodes_gpu, ntimes_gpu, ncols_gpu, grid=((int(ncols[0] / max_tpb)), int(nsamps[0]), 1), block=(max_tpb, 1, 1))
 
 
+'''
+ To get the likelihoods for all the samples, we will need to fold 
+ the block of time series up along the sample axis with reduction
+'''
+
+def reduce(reducer, rhoTS_expansion_gpu, ncols_gpu, nmodes_gpu): 	
+
+	griddimx = int(ncols[0] / max_tpb)
+	griddimy = int(nsamps[0])
+
+	grd =  (griddimx, griddimy, 1)
+	blk  = (max_tpb,  1,        1)		
+	
+	#FIXME - Doesn't support rhoTS longer then 1024**2 = 1048576 elements 
+	reducer(rhoTS_expansion_gpu, ncols_gpu, nmodes_gpu, grid=grd, block=blk, shared=16*max_tpb)		
+	# Run again to sum the block sums
+	grd = (1, griddimy, 1)
+	blk = (griddimx, 1, 1) # Need a thread for each row block from first call
+	reducer(rhoTS_expansion_gpu, ncols_gpu, nmodes_gpu, grid=grd, block=blk, shared=16*griddimx)
+
+	
+
+_reducer = mod.get_function("nv_reduc")
+reduce(_reducer, all_rhots_ylm, ncols_gpu, nmodes_gpu)
+
+import pdb
+pdb.set_trace()
+x = 2
 
 
