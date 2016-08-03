@@ -32,13 +32,6 @@ __global__ void complex_antenna_factor(double *R, double *ra, double *dec, doubl
 	Y[1] =  sin(psi[gid]) * cos(gha) + cos(psi[gid]) * sin(gha) * sin(dec[gid]);
 	Y[2] =  cos(psi[gid]) * cos(dec[gid]);	
 
-       // X[0] = 1.0; 
-       // X[1] = 1.0;
-       // X[2] = 1.0;
-       // Y[0] = 1.0;
-       // Y[1] = 1.0;
-       // Y[2] = 1.0;
-
 	__syncthreads();
 	
 	double Fp;
