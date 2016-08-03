@@ -7,9 +7,11 @@ from math import pi
 
 mydat = np.arange(12).astype(np.float64)
 mydat_gpu = gpuarray.to_gpu(mydat)
+myresult = np.array(0, ndmin=1).astype(np.float64)
+myresult_gpu = gpuarray.to_gpu(myresult)
 
 mod = SourceModule("""
-__global__ void my_kernel(double *mydat) {
+__global__ void my_kernel(double *mydat, double *myresult) {
 	extern __shared__ double shr[];
 	int id = threadIdx.x;
 
@@ -31,6 +33,7 @@ __global__ void my_kernel(double *mydat) {
 	for (int i = 0; i < 3; i++) {
 		result += X[i] + Y[i];
 	}
+	myresult[0] += result;
 }
 """)
 
@@ -38,4 +41,5 @@ my_kernel = mod.get_function("my_kernel")
 blk = (1,1,1)
 grd = (1,1,1)
 
-my_kernel(mydat_gpu, grid=grd, block=blk, shared=(8*6)) 
+my_kernel(mydat_gpu, myresult_gpu, grid=grd, block=blk, shared=(8*6))
+print(myresult_gpu.get())
