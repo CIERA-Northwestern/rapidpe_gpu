@@ -54,6 +54,9 @@ RA = np.linspace(0, 2*pi, nsamps).astype(np.float64)
 DEC = np.linspace(0, 2*pi, nsamps).astype(np.float64)
 PSI = np.linspace(0, 2*pi, nsamps).astype(np.float64)
 
+
+
+
 tref = np.array([24715.581890875823 for item in RA]).astype(np.float64)
 
 RA_gpu = gpuarray.to_gpu(RA)
@@ -61,8 +64,8 @@ DEC_gpu = gpuarray.to_gpu(DEC)
 PSI_gpu = gpuarray.to_gpu(PSI)
 tref_gpu = gpuarray.to_gpu(tref)
 
-R = np.array([-0.3926141 , -0.07761341, -0.24738905 
-              -0.07761341,  0.31952408,  0.22799784
+R = np.array([-0.3926141 , -0.07761341, -0.24738905, 
+              -0.07761341,  0.31952408,  0.22799784,
               -0.24738905,  0.22799784,  0.07309003]).astype(np.float64)
 
 R_gpu = gpuarray.to_gpu(R)
