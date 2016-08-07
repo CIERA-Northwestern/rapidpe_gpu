@@ -262,6 +262,35 @@ __global__ void complex_antenna_factor(double *R, double *ra, double *dec, doubl
 	}
 	result[gid] = make_cuDoubleComplex(Fp, Fc);
 }
+
+__device__ cuDoubleComplex cpx_outer_prod(cuDoubleComplex *CT, cuDoubleComplex *V) {
+        
+        cuDoubleComplex result = make_cuDoubleComplex(0.0, 0.0);
+        
+        for (int i = 0; i < 3; i++) {
+                for (int j = 0; j < 3; j++) {
+                        result = cuCadd(result, cuCmul(cuCmul(cuConj(V[i]), CT[i*3 + j]), V[j]));       
+                }
+        }
+        return result;
+}
+
+__global__ void make_3x3_outer_prods(cuDoubleComplex *CT, cuDoubleComplex *all_V, cuDoubleComplex *out, int *nmodes, int *nsamps) {
+
+        extern __shared__ cuDoubleComplex allshr[];
+
+        int gid = get_global_idx_1d_1d();       
+        int id  = threadIdx.x; 
+                        
+        cuDoubleComplex *myshr = &allshr[*nmodes*id];
+
+        for (int i = 0; i < *nmodes; i++) {
+                myshr[i] = all_V[(*nsamps * i) + id];   
+        }
+
+        out[gid] = cpx_outer_prod(CT, myshr); 
+
+}
 ''')
 
 
@@ -539,5 +568,37 @@ def reduce(reducer, rhoTS_expansion_gpu, ncols_gpu, nmodes_gpu):
 _reducer = mod.get_function("nv_reduc")
 reduce(_reducer, all_rhots_ylm, ncols_gpu, nmodes_gpu)
 
+# Pull out the maxes and sums 
+sums_and_maxes = all_rhots_ylm[:,0]
 
+
+#_____________________
+# Collect U and V 
+#_____________________
+
+U = np.zeros(nsamps).astype(np.complex128)
+V = np.zeros(nsamps).astype(np.complex128)
+
+U_gpu = gpuarray.to_gpu(U)
+V_gpu = gpuarray.to_gpu(V)
+
+CTU = np.eye(3)
+CTV = np.eye(3)
+
+CTU_gpu = gpuarray.to_gpu(CTU)
+CTV_gpu = gpuarray.to_gpu(CTV)
+
+def make_crossterms(crossterm_maker, ylms, ctu, ctv, u_out, v_out, nmodes_gpu, nsamps_gpu):
+	griddimx = int(nsamps[0] / max_tpb)  
+	
+	grd = (griddimx, 1, 1)
+	blk = (max_tpb,  1, 1)	
+	
+	crossterm_maker(ctu, ylms, u_out, nmodes_gpu, nsamps_gpu, grid=grd, block=blk, shared=(16*3*max_tpb))
+	crossterm_maker(ctv, ylms, v_out, nmodes_gpu, nsamps_gpu, grid=grd, block=blk, shared=(16*3*max_tpb))
+
+_crossterm_maker = mod.get_function("make_3x3_outer_prods")
+make_crossterms(_crossterm_maker, spharms_l_eq_2_gpu, CTU_gpu, CTV_gpu, U_gpu, V_gpu, nmodes_gpu, nsamps_gpu)
+import pdb
+pdb.set_trace()
 
