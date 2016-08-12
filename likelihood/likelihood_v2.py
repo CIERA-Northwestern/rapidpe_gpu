@@ -8,7 +8,8 @@ from pycuda.compiler import SourceModule
 import pycuda.autoinit
 import math
 import pycuda.gpuarray as gpuarray
-
+from pycuda.tools import dtype_to_ctype
+from string import Template
 
 # Cuda C
 mod=SourceModule('''
@@ -145,6 +146,19 @@ __global__ void expand_rhoTS(cuDoubleComplex *rhots, cuDoubleComplex *rhots_all)
         
 }
 
+
+__global__ void double_expand_rhoTS(double *rhots, double *rhots_all) {
+        
+        int gid = get_global_idx_2d_1d();
+        int linidx = get_xidx_within_row();
+        int which_mode = blockIdx.y % *nmodes;
+
+        if (linidx < *ntimes) {
+                rhots_all[gid] = rhots[*ntimes*which_mode + linidx];
+        }       
+        
+}
+
 __global__ void insert_ylms(cuDoubleComplex *padded_ts_all, cuDoubleComplex *ylms_all) {
         extern __shared__ cuDoubleComplex shr[]; // My Ylms will reside here     
         if (threadIdx.x < *nmodes) {
@@ -208,7 +222,8 @@ __global__ void bcast_vec_to_matrix(double *matrix, double *vector) {
 	__syncthreads();
 
 	if (linidx < *ntimes) {
-		matrix[gid] += myval[0];  	
+		matrix[gid + (*nmodes-2)*gridDim.x*blockDim.x] += myval[0];  	
+		matrix[gid + (*nmodes-1)*gridDim.x*blockDim.x] += myval[0];  	
 	}  
 }
 
@@ -272,9 +287,9 @@ psi   = np.linspace(0, 2*math.pi, nsamps).astype(np.float64)
 tref = np.array([24715.581890875823 for item in theta]).astype(np.float64)
 
 rhoTS = np.ones((nmodes, ntimes)).astype(np.complex128)
-rhoTS[0,:] = np.arange(ntimes)
-rhoTS[1,:] = 2.0*np.arange(ntimes)
-rhoTS[2,:] = 3.0*np.arange(ntimes)
+rhoTS[0,:] = np.arange(ntimes) + 1.0j*np.arange(ntimes)
+rhoTS[1,:] = 2.0*np.arange(ntimes) + 1.0j*2.0*np.arange(ntimes)
+rhoTS[2,:] = 3.0*np.arange(ntimes) + 1.0j*3.0*np.arange(ntimes)
 
 #_____________________
 #   Pass down data 
@@ -370,13 +385,49 @@ nblockx = int(nclmns / max_tpb)
 nblocky = int(nsamps * nmodes)
 grd = (nblockx, nblocky, 1)
 blk = (max_tpb, 1,       1)
-import pdb
-pdb.set_trace()
 GPU_expand_rhoTS(rhoTS_gpu, all_l_rhots_gpu, grid=grd, block=blk)
 
 '''
 Multiply the F,Ylm products into the large timeseries block
 '''
+
+####################################################################################
+# FOR UNIT TEST ONLY ###############################################################
+####################################################################################
+
+'''
+ Ylms are stored in row major order ranging from lowest value of m to the highest
+
+ |-----------(2,-2)-----------|----------(2,0)---------|-----------(2,2)---------| 
+
+ [0+0j, 1+1j, 2+2j...1023+1023j, 1024+1024j...2047+2047j, 2048+2048j...3071+3017j]
+ 
+ Assuming some strange case where they are the simple sequence of numbers above we 
+ should expect the following results from multiplying them into the block of rhoTS
+
+ all_l_rhots = | 0+0j, 1+1j, 2+2j...| <- this row should get multiplied by 0+0j 
+               | 0+0j, 2+2j, 4+4j...| <- this row should get multiplied by 1024+1024j
+               | 0+0j, 3+3j, 6+6j...| <- this row should get multiplied by 2048+2048j
+               | 0+0j, 1+1j, 2+2j...| <- this row should get multiplied by 1+1j
+               | 0+0j, 2+2j, 4+4j...| <- this row should get multiplied by 1025+1025j
+               | 0+0j, 3+3j, 6+6j...| <- this row should get multiplied by 2049+2049j
+
+ So we should end up with:
+
+ all_l_rhots = | 0+0j, 0+0j,     0+0j     ...|
+               | 0+0j, 0+4096j,  0+8192j  ...| 
+               | 0+0j, 0+12288j, 0+24576j ...|
+               | 0+0j, 0+2j,     0+4j     ...| 
+               | 0+0j, 0+4100j,  0+8200j  ...|
+               | 0+0j, 0+12294j, 0+24588j ...| 
+
+
+
+''' 
+##### UNCOMMENT FOR UNIT TEST
+spharms_l_eq_2 = np.arange(nmodes*nsamps).astype(np.complex128) + np.arange(nmodes*nsamps).astype(np.complex128)*1.0j
+spharms_l_eq_2_gpu = gpuarray.to_gpu(spharms_l_eq_2)
+
 
 nblockx = int(nclmns / max_tpb)
 nblocky = int(nsamps * nmodes)
@@ -385,10 +436,32 @@ grd = (nblockx, nblocky, 1)
 blk = (max_tpb, 1,       1)
 
 GPU_insert_ylms(all_l_rhots_gpu, spharms_l_eq_2_gpu, grid=grd, block=blk, shared=(int(nmodes*16)))
+# ***** THIS IS CORRECT AND WORKING UP THROUGH HERE AS OF AUGUST 10TH 2016 ***** 
 
 '''
 Sum downwards to collect F-YLM-RHOTS row-wise sums
 '''
+
+####################################################################################
+# FOR UNIT TEST ONLY ###############################################################
+####################################################################################
+
+'''
+ We have the result as produced by the previous unit test, this function should
+ sum downwards over nmodes rows before copying their destination row to the 2nd
+ to last row as a final step. 
+
+ At that point the information is all present in the final row so using the old
+ rows as free memory shouldn't disturb anything. We should end up with:
+
+ all_l_rhots = | 0+0j, 0+0j,     0+0j     ...|  
+               | 0+0j, 0+16384j, 0+32768j ...|
+               | 0+0j, 0+16384j, 0+32768j ...|
+               | 0+0j, 0+2j,     0+4j     ...| 
+               | 0+0j, 0+16396j, 0+32792j ...|
+               | 0+0j, 0+16396j, 0+32792j ...|
+'''
+
 
 nblockx = int(nclmns / max_tpb)
 nblocky = int(nsamps)
@@ -398,9 +471,23 @@ grd = (nblockx, nblocky, 1)
 blk = (max_tpb, 1,       1)
 
 GPU_accordion(all_l_rhots_gpu, grid=grd, block=blk) 
+# ***** THIS IS CORRECT AND WORKING UP THROUGH HERE AS OF AUGUST 10TH 2016 ***** 
 
 '''
 Generate and collect U and V terms
+'''
+
+'''
+ Given that for the unit test the ylms are the linear array as described above, and the crossterms are all set
+ to 2.0, we should have
+
+ U_gpu = V_gpu = (0-0j)*2*(0+0j) + (1024-1024j)*2*(1024+1024j) + (2048-2048j)*2*(2048+2048j) = 20971520 
+		 (1-1j)*2*(1+1j) + (1025-1025j)*2*(1025+1025j) + (2049-2049j)*2*(2049+2049j) = 20996108 
+                 (2-2j)*2*(2+2j) + (1026-1026j)*2*(1026+1026j) + (2050-2050j)*2*(2050+2050j) = 21020720 
+                 ...........................................................................
+                 ...........................................................................
+                 ...........................................................................
+
 '''
 
 U = np.zeros(nsamps).astype(np.complex128)
@@ -410,8 +497,8 @@ V_gpu = gpuarray.to_gpu(V)
 
 # FIXME - these should exist dynamically within constant memory 
 
-CTU = np.eye(3).astype(np.float64)
-CTV = np.eye(3).astype(np.float64)
+CTU = 2.0*np.eye(3).astype(np.complex128)
+CTV = 2.0*np.eye(3).astype(np.complex128)
 CTU_gpu = gpuarray.to_gpu(CTU)
 CTV_gpu = gpuarray.to_gpu(CTV)
 
@@ -420,15 +507,39 @@ griddimx = int(nsamps / max_tpb)
 
 GPU_make_3x3_outer_prods(CTU_gpu, spharms_l_eq_2_gpu, U_gpu, grid=grd, block=blk, shared=int(16*nmodes*max_tpb))
 GPU_make_3x3_outer_prods(CTV_gpu, spharms_l_eq_2_gpu, V_gpu, grid=grd, block=blk, shared=int(16*nmodes*max_tpb))
+# ***** THIS IS CORRECT AND WORKING UP THROUGH HERE AS OF AUGUST 10TH 2016 ***** 
+
+'''
+ Given the U and V terms as calculated in the unit test above, we should be able to write down 
+ the expected result of this calculation. There is no slicing, it should be simple broadcasts. 
+
+ The only thing that we acutally need to modify to be something sensible is the antenna factor
+ let's make it a linear array of complex numbers just like the spherical harmonics.
+
+ then we should have:
+
+
+ term_two = (0+0j)*(0-0j)*20971520 - RE((0+0j)*(0+0j)*20971520) = 0
+ term_two = (1+1j)*(1-1j)*20996108 - RE((1+1j)*(1+1j)*20996108) = 41992216
+ term_two = (2+2j)*(2-2j)*21020720 - RE((2+2j)*(2+2j)*21020720) = 168165760
+ ..............................................................
+
+'''
+
+##### UNCOMMENT FOR UNIT TEST
+caf = np.arange(nsamps).astype(np.complex128) + np.arange(nsamps).astype(np.complex128)*1.0j
+caf_gpu = gpuarray.to_gpu(caf)
 
 # This is the entire crossterm expression
-term_two = caf_gpu*caf_gpu.conj()*U_gpu - (caf_gpu*caf_gpu*V_gpu).real 
+term_two = (caf_gpu*caf_gpu.conj()*U_gpu - (caf_gpu*caf_gpu*V_gpu).real).real
+# ***** THIS IS CORRECT AND WORKING UP THROUGH HERE AS OF AUGUST 10TH 2016 ***** 
 
 # Take the real part
-all_l_rhots_gpu= all_l_rhots_gpu.real 
+all_l_rhots_gpu = all_l_rhots_gpu.real 
 '''
 Subtract U and V terms from big block of rhoTS
 '''
+
 
 griddimx = int(nclmns / max_tpb) 
 griddimy = int(nsamps) 
@@ -437,10 +548,39 @@ grd = (griddimx, griddimy, 1)
 blk = (max_tpb,  1,        1)
 
 GPU_bcast_vec_to_matrix(all_l_rhots_gpu, term_two, grid=grd, block=blk, shared=8)
+# ***** THIS IS CORRECT AND WORKING UP THROUGH HERE AS OF AUGUST 10TH 2016 ***** 
 
 '''
-Get the maxes of all the relevant rows - must do it twice because max is blockwise
+ Get the maxes of all the relevant rows - must do it twice because max is blockwise
 '''
+
+'''
+ Since we have confirmed everything is working up to this point, let's reset the 
+ expanded rhoTS to test to see if our maxfinding and summation functions work   
+'''
+
+##### UNCOMMENT FOR UNIT TEST
+rhoTS = np.real(rhoTS).astype(np.float64) 
+rhoTS[1,:] = rhoTS[2,:]
+rhoTS_gpu = gpuarray.to_gpu(rhoTS)
+all_l_rhots = np.real(all_l_rhots).astype(np.float64)
+all_l_rhots_gpu = gpuarray.to_gpu(all_l_rhots)
+
+GPU_double_expand_rhoTS = mod.get_function("double_expand_rhoTS")
+nblockx = int(nclmns / max_tpb)
+nblocky = int(nsamps * nmodes)
+grd = (nblockx, nblocky, 1)
+blk = (max_tpb, 1,       1)
+
+GPU_double_expand_rhoTS(rhoTS_gpu, all_l_rhots_gpu, grid=grd, block=blk)
+
+griddimx = int(nclmns / max_tpb)
+griddimy = int(nsamps)
+# One thread per sample-time
+grd = (griddimx, griddimy, 1)
+blk = (max_tpb,  1,        1)
+
+#####
 
 GPU_find_max_in_shrmem(all_l_rhots_gpu, grid=grd, block=blk, shared=int(max_tpb*8))
 
@@ -460,6 +600,17 @@ griddimy = int(nsamps)
 grd = (griddimx, griddimy, 1)
 blk = (max_tpb,  1,        1)
 
-GPU_bcast_vec_to_matrix(all_l_rhots_gpu, all_l_rhots_gpu[2::3], grid=grd, block=blk, shared=8)
+maxes = np.array(all_l_rhots_gpu[:,0][1::nmodes].get()).astype(np.float64)
+maxes_gpu = gpuarray.to_gpu(maxes)
+
+GPU_bcast_vec_to_matrix(all_l_rhots_gpu, -maxes_gpu, grid=grd, block=blk, shared=8)
+# ***** THIS IS CORRECT AND WORKING UP THROUGH HERE AS OF AUGUST 10TH 2016 ***** 
+
+''' 
+ Marginalize over Time
+'''
+
+
+
 
 
