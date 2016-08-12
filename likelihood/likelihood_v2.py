@@ -6,11 +6,11 @@ import pycuda.driver as cuda
 # write cuda c modules 
 from pycuda.compiler import SourceModule
 import pycuda.autoinit
+import pycuda.cumath as cumath
 import math
 import pycuda.gpuarray as gpuarray
 from pycuda.tools import dtype_to_ctype
 from string import Template
-
 # Cuda C
 mod=SourceModule('''
 #include<math.h>
@@ -249,8 +249,30 @@ __global__ void find_max_in_shrmem(double *all_rhots) {
 	if (threadIdx.x == 0) {
 		my_row[blockIdx.x] = share[0];	
 	} 
-
 } 
+
+__global__ void nv_reduc(double *indat) {
+        extern __shared__ double shr[]; 
+
+        // local and lobal thread ID
+        unsigned int linidx = get_xidx_within_row();
+
+        double *myrow = &indat[*ncols*(*nmodes*blockIdx.y + *nmodes - 1) ];    
+
+        shr[threadIdx.x] = myrow[linidx];
+        __syncthreads();
+
+        for (unsigned int s=blockDim.x/2; s>0; s /= 2) {
+                if (threadIdx.x < s) {
+                        shr[threadIdx.x] = shr[threadIdx.x] + shr[threadIdx.x+s];
+                }
+                __syncthreads();
+        }       
+        if (threadIdx.x == 0) {
+                myrow[blockIdx.x] = shr[0];
+        }
+}
+
 
 ''')
 
@@ -333,6 +355,8 @@ GPU_accordion = mod.get_function("accordion")
 GPU_make_3x3_outer_prods = mod.get_function("make_3x3_outer_prods")
 GPU_bcast_vec_to_matrix = mod.get_function("bcast_vec_to_matrix")
 GPU_find_max_in_shrmem = mod.get_function("find_max_in_shrmem")
+GPU_nv_reduc = mod.get_function("nv_reduc")
+
 
 ######################################################################
 # MAIN ROUTINE #######################################################
@@ -610,6 +634,11 @@ GPU_bcast_vec_to_matrix(all_l_rhots_gpu, -maxes_gpu, grid=grd, block=blk, shared
  Marginalize over Time
 '''
 
+all_l_rhots_gpu = cumath.exp(all_l_rhots_gpu) # exponentiate 
+
+GPU_nv_reduc(all_l_rhots_gpu) # sum over time 
+
+lnL_gpu = maxes_gpu + cumath.log(all_l_rhots_gpu) # TIMES DELTA T FIXME
 
 
 
