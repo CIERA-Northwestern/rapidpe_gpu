@@ -41,6 +41,18 @@ from lalinference.rapid_pe.common_cl import param_limits
 
 from lalinference import fits as bfits
 
+#_ CUDA stuff
+import math
+import pycuda
+import pycuda.autoinit
+import pycuda.driver as cuda
+import pycuda.cumath as cumath
+import pycuda.gpuarray as gpuarray
+from pycuda.tools import dtype_to_ctype
+
+#_ SourceModule allows us to write CUDA C
+from pycuda.compiler import SourceModule
+
 __author__ = "Evan Ochsner <evano@gravity.phys.uwm.edu>, Chris Pankow <pankow@gravity.phys.uwm.edu>, R. O'Shaughnessy"
 
 #
@@ -520,14 +532,42 @@ else: # Sum over time for every point in other extrinsic params
     # time series
     tvals = numpy.linspace(-t_ref_wind, t_ref_wind, int(t_ref_wind * 2 / P.deltaT))
 
+
+
+    ##### RETRIEVE CUDA C
     mod = factored_likelihood.get_cuda_c()
+    GPU_fill_with_zeros = mod.get_function("fill_with_zeros")
+# FIXME  - this is pretty bad
+    max_tpb = 1024 # Max number of threads per block for GPU: FIXME should be an --option
+    ntimes = len(rholms['H1'][(2,0)]) # FIXME this should be dynamic 
+    nmodes = len(rholms['H1'].keys()) # FIXME this should be dynamic too 
+    nclmns  = numpy.int32( ntimes + max_tpb - (ntimes % max_tpb) ) # Number of cols to pad w/ 0s 
+    nsamps = 20480
+
+
+    # We want to allocate these and transfer them down before we start integrating
+    # That way we don't have to spend a huge amount of extra time transferring data
+    print("Transferring Working Block to GPU...\n")
+    working_lnL_block = numpy.zeros((nsamps * nmodes, nclmns)).astype(numpy.complex128)
+    working_lnL_block_gpu = gpuarray.to_gpu(working_lnL_block)
+
+    lnL_block = numpy.zeros((nsamps * nmodes, nclmns)).astype(numpy.float64)
+    lnL_block_gpu = gpuarray.to_gpu(lnL_block)
+
     def likelihood_function(right_ascension, declination, phi_orb, inclination,
             psi, distance):
 
-	###
 	'''
-	import math
+	# FIXME  - this is pretty bad
+	max_tpb = 1024 # Max number of threads per block for GPU: FIXME should be an --option
+	ntimes = len(rholms['H1'][(2,0)]) # FIXME this should be dynamic 
+	nmodes = len(rholms['H1'].keys()) # FIXME this should be dynamic too 
+	nclmns  = numpy.int32( ntimes + max_tpb - (ntimes % max_tpb) ) # Number of cols to pad w/ 0s 
 	nsamps = len(right_ascension)
+	'''
+
+	###
+	import math
 	right_ascension = numpy.linspace(0.1, math.pi, nsamps) + 1.0 
 	declination = numpy.linspace(0.1, math.pi, nsamps) + 2.0
 	tref = numpy.linspace(0.1, math.pi, nsamps) + 3.0
@@ -538,7 +578,6 @@ else: # Sum over time for every point in other extrinsic params
 	distance = numpy.ones(nsamps).astype(numpy.float64)
 	### 
 	'''
-
 	right_ascension = right_ascension.astype(numpy.float64)
 	declination = declination.astype(numpy.float64)
 	tref = numpy.array([fiducial_epoch for item in right_ascension]).astype(numpy.float64)
@@ -546,9 +585,14 @@ else: # Sum over time for every point in other extrinsic params
 	inclination = inclination.astype(numpy.float64)
 	psi = psi.astype(numpy.float64)
 	distance = distance.astype(numpy.float64)*1.e6*lal.PC_SI
-	lnL_cuda = numpy.zeros(len(right_ascension))
 
+	# Pass a block of zeros onto the GPU to hold results from each detector
+	lnL_block = numpy.zeros((nsamps * nmodes, nclmns)).astype(numpy.float64)
+	lnL_block_gpu = gpuarray.to_gpu(lnL_block)
+	'''
+	
 	for det in rholms.keys():
+		# Convert the crossterms to matrices
                 CTU = numpy.zeros(len(cross_termsU[det].keys()), dtype=numpy.complex128)
                 CTV = numpy.zeros(len(cross_termsV[det].keys()), dtype=numpy.complex128)
                 sort_terms_keys = sorted(cross_termsU[det], key=lambda tup: (tup[0][1], tup[1][1]))
@@ -558,9 +602,14 @@ else: # Sum over time for every point in other extrinsic params
                 side = numpy.sqrt(len(cross_termsU[det].keys()))
                 CTU = CTU.reshape((side, side))
                 CTV = CTV.reshape((side, side))
+
                 det_tns = numpy.array(lalsim.DetectorPrefixToLALDetector(det).response).astype(numpy.float64)
-                lnL_cuda += factored_likelihood.factored_log_likelihood_time_marginalized_gpu(mod, right_ascension, declination, tref, phi_orb, inclination, psi, distance, det_tns, rholms[det], CTU, CTV)* (tvals[1] - tvals[0])
-		herp = 0
+                lnL_block_gpu += factored_likelihood.factored_log_likelihood_time_marginalized_gpu(mod, right_ascension, declination, tref, phi_orb, inclination, psi, distance, det_tns, rholms[det], CTU, CTV)
+
+	print("Marginalizing over Time... \n")
+	network_lnL_marg_gpu = factored_likelihood.marginalize_all_lnL(mod, lnL_block_gpu, nmodes, nsamps, ntimes, nclmns, tvals[1]-tvals[0])
+	print("Done marginalizing over time. \n")
+
 	# OLD STUFF
         # use EXTREMELY many bits
         lnL = numpy.zeros(right_ascension.shape,dtype=numpy.float128)
@@ -571,16 +620,15 @@ else: # Sum over time for every point in other extrinsic params
                 phi_orb, inclination, psi, distance):
             P.phi = ph # right ascension
             P.theta = th # declination
-            P.tref =  fiducial_epoch  # see 'tvals', above
+            P.tref =  tref[i] #fiducial_epoch  # see 'tvals', above
             P.phiref = phr # ref. orbital phase
             P.incl = ic # inclination
             P.psi = ps # polarization angle
             P.dist = di* 1.e6 * lal.PC_SI # luminosity distance
             lnL[i] = factored_likelihood.factored_log_likelihood_time_marginalized(tvals, P, rholms_intp, rholms, cross_termsU, cross_termsV, det_epochs, opts.l_max,interpolate=opts.interpolate_time)
             i+=1
-   	
 	import pdb
-	pdb.set_trace() 
+        pdb.set_trace()
         return numpy.exp(lnL)
 
     res, var, neff, dict_return = sampler.integrate(likelihood_function, *unpinned_params, **pinned_params)

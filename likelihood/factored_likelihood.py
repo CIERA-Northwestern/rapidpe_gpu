@@ -28,6 +28,23 @@ from scipy import special
 from itertools import product
 from common_cl import distRef
 
+
+#_ CUDA stuff
+import math
+import pycuda
+import pycuda.autoinit
+import pycuda.driver as cuda
+import pycuda.cumath as cumath
+import pycuda.gpuarray as gpuarray
+from pycuda.tools import dtype_to_ctype
+
+#_ SourceModule allows us to write CUDA C
+from pycuda.compiler import SourceModule
+
+
+
+
+
 __author__ = "Evan Ochsner <evano@gravity.phys.uwm.edu>, R. O'Shaughnessy"
 
 #
@@ -243,8 +260,6 @@ def factored_log_likelihood_time_marginalized(tvals, extr_params, rholms_intp, r
 		det_rholms[key] = rhoTS
                 #det_rholms[key] = rhoTS[ifirst:ilast]
         lnL += single_detector_log_likelihood(det_rholms, CTU, CTV, Ylms, F, dist)
-	
-
     maxlnL = np.max(lnL) 
     return maxlnL + np.log(np.sum(np.exp(lnL - maxlnL)) * (tvals[1]-tvals[0]))
 
@@ -266,7 +281,8 @@ def single_detector_log_likelihood(rholm_vals, crossTermsU, crossTermsV, Ylms, F
 
     Outputs: The value of ln L for a single detector given the inputs.
     """ 
-    invDistMpc = distRef/dist
+    #invDistMpc = distRef/dist
+    invDistMpc = 1.0
     Fstar = np.conj(F)
 
     term1, term20, term21 = 0., 0., 0.
@@ -285,7 +301,6 @@ def single_detector_log_likelihood(rholm_vals, crossTermsU, crossTermsV, Ylms, F
         term21 += tmp_term21 * Ylm1 * n_one_l1
     term1 = np.real( Fstar * term1 ) * invDistMpc 
     term1 += -0.25 * np.real( F * ( Fstar * term20 + F * term21 ) ) * invDistMpc * invDistMpc 
-
     return term1
 
 def compute_mode_ip_time_series(hlms, data, psd, fmin, fMax, fNyq,
@@ -580,16 +595,6 @@ def compute_mode_iterator(Lmax):  # returns a list of (l,m) pairs covering all m
 
 def get_cuda_c():
 
-        import pycuda
-        import pycuda.autoinit
-        import pycuda.driver as cuda
-        import pycuda.cumath as cumath
-        import pycuda.gpuarray as gpuarray
-        from pycuda.tools import dtype_to_ctype
-
-        #_ SourceModule allows us to write CUDA C
-        from pycuda.compiler import SourceModule
-
 
 	print("Compiling CUDA C... \n")
 
@@ -605,8 +610,8 @@ def get_cuda_c():
 	__constant__ double det_tns[9];
 
 
-	__constant__ double CTU[25];
-	__constant__ double CTV[25];
+	__constant__ cuDoubleComplex CTU[25];
+	__constant__ cuDoubleComplex CTV[25];
 
 
 	__device__ int get_global_idx_1d_1d() {
@@ -629,6 +634,7 @@ def get_cuda_c():
 				result = cuCadd(result, cuCmul(cuCmul(cuConj(V[i]), CT[i*3 + j]), V[j]));       
 			}
 		}
+		__syncthreads();
 		return result;
 	}
 
@@ -641,11 +647,20 @@ def get_cuda_c():
                                 result = cuCadd(result, cuCmul(cuCmul(V[i], CT[i*3 + j]), V[j]));       
                         }
                 }
+		__syncthreads();
                 return result;
         }
 
 
-
+	__global__ void fill_cpx_with_zeros(cuDoubleComplex *rhoTS_block) {
+		int gid = get_global_idx_2d_1d();
+		rhoTS_block[gid] = make_cuDoubleComplex(0.0, 0.0);	
+	}
+	
+	__global__ void fill_real_with_zeros(double *rhoTS_block) {
+		int gid = get_global_idx_2d_1d();
+		rhoTS_block[gid] = 0.0;
+	}
 
 	__global__ void compute_sph_harmonics_l_eq_2(double *theta, double *phi, int *sel_modes, cuDoubleComplex *result) {   
 
@@ -799,10 +814,13 @@ def get_cuda_c():
 		int id  = threadIdx.x; 
 				
 		cuDoubleComplex *myshr = &allshr[*nmodes*id];
+		__syncthreads();
+
 
 		for (int i = 0; i < *nmodes; i++) {
-			myshr[i] = all_V[(*nsamps * i) + id];   
+			myshr[i] = all_V[(*nsamps * i) + gid];   
 		}
+		__syncthreads();
 
 		out[gid] = cpx_outer_prod(CT, myshr); 
 
@@ -816,10 +834,12 @@ def get_cuda_c():
                 int id  = threadIdx.x; 
                                 
                 cuDoubleComplex *myshr = &allshr[*nmodes*id];
+		__syncthreads();
 
                 for (int i = 0; i < *nmodes; i++) {
-                        myshr[i] = all_V[(*nsamps * i) + id];   
+                        myshr[i] = all_V[(*nsamps * i) + gid];   
                 }
+		__syncthreads();
 
                 out[gid] = real_outer_prod(CT, myshr); 
 
@@ -878,12 +898,13 @@ def get_cuda_c():
 
 		for (unsigned int s=blockDim.x/2; s > 0; s /= 2) {
 			if (threadIdx.x < s) {
-				if (share[threadIdx.x] <= share[threadIdx.x + s]) {
+				if (share[threadIdx.x] <= share[threadIdx.x + s] && share[threadIdx.x + s] != 0.0) {
 					share[threadIdx.x] = share[threadIdx.x + s];
 				}
 			}       
 			__syncthreads();
 		}       
+		__syncthreads();
 
 		if (threadIdx.x == 0) {
 			my_row[blockIdx.x] = share[0];	
@@ -924,6 +945,7 @@ def get_cuda_c():
 
 
 def factored_log_likelihood_time_marginalized_gpu(mod, right_ascension, declination, tref, phiref, inclination, psi, distance, det_tns, rholms, CTU, CTV):
+
 	nsamps = len(right_ascension)
 	nmodes = len(rholms.keys()) # Number of modes
 	ntimes = len(rholms[rholms.keys()[0]]) # Number of times in rhoTS
@@ -933,14 +955,13 @@ def factored_log_likelihood_time_marginalized_gpu(mod, right_ascension, declinat
 	for i in range(0, len(rholms.keys())):
 		rhots_contig[i,:] = rholms[sort_terms_keys[i]]
 
-
 	return likelihood_function_gpu(mod, right_ascension, declination, tref, phiref, inclination, psi, distance, rhots_contig,  rholms.keys(), nsamps, ntimes, det_tns, CTU, CTV) 
 
 	
 def likelihood_function_gpu(mod, phi, theta, tref, phiref, incl, psi, distance, rhoTS, selected_modes, nsamps, ntimes, detector_tensor, CTU, CTV):
 
 	'''
-	GPU Accelerated, time-marginalized, factored log likelihood
+	GPU Accelerated, factored log likelihood
 	Description of Variables:
 	
 	PHI    - Right Ascension
@@ -952,27 +973,9 @@ def likelihood_function_gpu(mod, phi, theta, tref, phiref, incl, psi, distance, 
 	DIST   - Luminosity Distance
 	'''
 
-
-
-
-	#_ Preliminaries
-	import math
-	import pycuda
-	import pycuda.autoinit
-	import pycuda.driver as cuda
-	import pycuda.cumath as cumath
-	import pycuda.gpuarray as gpuarray
-	from pycuda.tools import dtype_to_ctype
-
-	#_ SourceModule allows us to write CUDA C
-	from pycuda.compiler import SourceModule
-
-	# CUDA C itself
-
-
 	#FIXME - Should print device properties here 
 	device = cuda.Device(0)
-	max_tpb = 512
+	max_tpb = 1024
 
 	#______________NECESSARY CONSTANTS ##
 	nclmns  = np.int32( ntimes + max_tpb - (ntimes % max_tpb) ) # Number of cols to pad w/ 0s	
@@ -1047,6 +1050,9 @@ def likelihood_function_gpu(mod, phi, theta, tref, phiref, incl, psi, distance, 
 	'''
 	Calculate the spherical harmonics
 	'''
+
+	print("Calculating Spherical Harmonics...\n")
+
 	spharms_l_eq_2 = np.zeros(nsamps*nmodes).astype(np.complex128)
 	spharms_l_eq_2_gpu = gpuarray.to_gpu(spharms_l_eq_2)
 	# One thread for each sample, 1D1D
@@ -1060,6 +1066,7 @@ def likelihood_function_gpu(mod, phi, theta, tref, phiref, incl, psi, distance, 
 	Calculate F and multiply them correctly into the Ylms
 	'''
 
+	print("Calculating Complex Antenna Factor...\n")
 	complex_antenna_factor = np.zeros(nsamps).astype(np.complex128)
 	caf_gpu = gpuarray.to_gpu(complex_antenna_factor)
 	# One thread for each sample, 1D1D
@@ -1072,9 +1079,12 @@ def likelihood_function_gpu(mod, phi, theta, tref, phiref, incl, psi, distance, 
 	# to modes
 
 	# Conjugate
+
+
+	print("Calculating F*Ylm Products... \n")
+
         spharms_l_eq_2_orig_gpu = spharms_l_eq_2_gpu
 	spharms_l_eq_2_gpu = spharms_l_eq_2_gpu.conj()
-
 
 	for i in range(0, nmodes):
 		strt_mode = i*nsamps
@@ -1086,6 +1096,9 @@ def likelihood_function_gpu(mod, phi, theta, tref, phiref, incl, psi, distance, 
 	'''
 
 	# Large memory block containing all rhoTS 
+
+	print("Transferring down rhoTS block...\n")
+
 	all_l_rhots = np.zeros((nsamps * nmodes, nclmns)).astype(np.complex128)
 	all_l_rhots_gpu = gpuarray.to_gpu(all_l_rhots)
 	# Blanket the array with threads
@@ -1094,6 +1107,8 @@ def likelihood_function_gpu(mod, phi, theta, tref, phiref, incl, psi, distance, 
 	nblocky = int(nsamps * nmodes)
 	grd = (nblockx, nblocky, 1)
 	blk = (max_tpb, 1,       1)
+
+	print("Expanding rhoTS block...\n")
 	GPU_expand_rhoTS(rhoTS_gpu, all_l_rhots_gpu, grid=grd, block=blk)
 
 	'''
@@ -1106,6 +1121,7 @@ def likelihood_function_gpu(mod, phi, theta, tref, phiref, incl, psi, distance, 
 	grd = (nblockx, nblocky, 1)
 	blk = (max_tpb, 1,       1)
 
+	print("Inserting F*Ylm Products to rhoTS...\n")
 	GPU_insert_ylms(all_l_rhots_gpu, spharms_l_eq_2_gpu, grid=grd, block=blk, shared=(int(nmodes*16)))
 
 	'''
@@ -1119,12 +1135,15 @@ def likelihood_function_gpu(mod, phi, theta, tref, phiref, incl, psi, distance, 
 	grd = (nblockx, nblocky, 1)
 	blk = (max_tpb, 1,       1)
 
+	print("Summing over Harmonic Modes...\n")
 	GPU_accordion(all_l_rhots_gpu, grid=grd, block=blk)
 
 	# Take the real part
 	all_l_rhots_gpu = all_l_rhots_gpu.real
 
 	# Multiply in the distances	
+
+	print("Scaling by Reference Distance...\n")
 	GPU_mul_bcast_vec_to_matrix(all_l_rhots_gpu, dist_gpu, grid=grd, block=blk, shared=8)
 
 
@@ -1142,17 +1161,23 @@ def likelihood_function_gpu(mod, phi, theta, tref, phiref, incl, psi, distance, 
 
 	# FIXME - these should exist dynamically within constant memory 
 
+
+	print("Building Term 2 Outer Products...\n")
 	CTU_gpu = gpuarray.to_gpu(CTU)
 	CTV_gpu = gpuarray.to_gpu(CTV)
 
 	griddimx = int(nsamps / max_tpb)
 	# One thread per sample, each thread builds one U and V crossterm 
 
+	griddimx = int(nsamps / max_tpb)
+	grd = (griddimx, 1, 1)
+	blk = (max_tpb,  1, 1)
+
 	GPU_make_cpx_3x3_outer_prods(CTU_gpu, spharms_l_eq_2_orig_gpu, U_gpu, grid=grd, block=blk, shared=int(16*nmodes*max_tpb))
 	GPU_make_real_3x3_outer_prods(CTV_gpu, spharms_l_eq_2_orig_gpu, V_gpu, grid=grd, block=blk, shared=int(16*nmodes*max_tpb))	
 
 	term_two = 0.25*dist_gpu*dist_gpu*(caf_gpu*caf_gpu.conj()*U_gpu + (caf_gpu*caf_gpu*V_gpu).real).real
-
+	
 
 	'''
 	Subtract U and V terms from big block of rhoTS
@@ -1164,12 +1189,45 @@ def likelihood_function_gpu(mod, phi, theta, tref, phiref, incl, psi, distance, 
 	grd = (griddimx, griddimy, 1)
 	blk = (max_tpb,  1,        1)
 
+	print("Subtracting Term 2 from Term1...\n")
 	GPU_bcast_vec_to_matrix(all_l_rhots_gpu, -term_two, grid=grd, block=blk, shared=8)
 
+	return all_l_rhots_gpu
+
+
+def marginalize_all_lnL(mod, all_l_rhots_gpu, nmodes, nsamps, ntimes, nclmns, delta_t):
+	# Recopy constants into device constant memory
+
+	# **-- constants --**
+	max_tpb = 1024 
+	
+	nmodes_gpu = mod.get_global("nmodes")[0]
+	nsamps_gpu = mod.get_global("nsamps")[0]
+	ntimes_gpu = mod.get_global("ntimes")[0]
+	nclmns_gpu = mod.get_global("nclmns")[0]
+
+	cuda.memcpy_htod(nmodes_gpu, np.array(nmodes, ndmin=1).astype(np.int32))
+	cuda.memcpy_htod(nsamps_gpu, np.array(nsamps, ndmin=1).astype(np.int32))
+	cuda.memcpy_htod(ntimes_gpu, np.array(ntimes, ndmin=1).astype(np.int32))
+	cuda.memcpy_htod(nclmns_gpu, np.array(nclmns, ndmin=1).astype(np.int32))
+
+	# Get GPU functions
+
+	GPU_find_max_in_shrmem = mod.get_function("find_max_in_shrmem")
+	GPU_nv_reduc = mod.get_function("nv_reduc")
+	GPU_bcast_vec_to_matrix = mod.get_function("bcast_vec_to_matrix")
 
 	def next_greater_power_of_2(x):  
     		return 2**(x-1).bit_length()
 
+
+        griddimx = int(nclmns / max_tpb)
+        griddimy = int(nsamps)
+        # One thread per sample-time
+        grd = (griddimx, griddimy, 1)
+        blk = (max_tpb,  1,        1)
+
+	print("Finding Maximum...\n")
 	# Get the maxes
 	GPU_find_max_in_shrmem(all_l_rhots_gpu, grid=grd, block=blk, shared=int(max_tpb*8))
 
@@ -1177,7 +1235,6 @@ def likelihood_function_gpu(mod, phi, theta, tref, phiref, incl, psi, distance, 
 	blokdimx = next_greater_power_of_2(griddimx) # Only need as many threads as we had blocks in x dimension
 	grd = (1, griddimy, 1)
 	blk = (blokdimx, 1, 1)
-
 	# Second reduction - this works as long as we don't have rhoTS longer then 1024^2
 	GPU_find_max_in_shrmem(all_l_rhots_gpu, grid=grd, block=blk, shared=int(blokdimx*8))
 	
@@ -1191,6 +1248,7 @@ def likelihood_function_gpu(mod, phi, theta, tref, phiref, incl, psi, distance, 
 	grd = (griddimx, griddimy, 1)
 	blk = (max_tpb,  1,        1)
 
+
 	GPU_bcast_vec_to_matrix(all_l_rhots_gpu, -maxes_gpu, grid=grd, block=blk, shared=8)
 
 	# Exponentiating a bunch of zeros creates a bunch of extra ones that we don't want in our
@@ -1200,6 +1258,7 @@ def likelihood_function_gpu(mod, phi, theta, tref, phiref, incl, psi, distance, 
 
 	all_l_rhots_gpu = cumath.exp(all_l_rhots_gpu) # exponentiate 
 
+	print("Reducing final answer...\n")
 	GPU_nv_reduc(all_l_rhots_gpu, grid=grd, block=blk, shared=max_tpb*8) # sum over time 
 
 	griddimy = int(nsamps)
@@ -1211,6 +1270,6 @@ def likelihood_function_gpu(mod, phi, theta, tref, phiref, incl, psi, distance, 
 
 	lnL = (all_l_rhots_gpu[:,0][nmodes-1::nmodes].get() - padwidth).astype(np.float64)
 	lnL_gpu = gpuarray.to_gpu(lnL)
-	lnL_gpu = maxes_gpu + cumath.log(lnL_gpu)
+	lnL_gpu = maxes_gpu + cumath.log(lnL_gpu*delta_t)
 
 	return lnL_gpu.get()
